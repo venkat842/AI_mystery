@@ -1,0 +1,39 @@
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import mongoose from 'mongoose';
+import Case from './model.js';
+
+const app=express(); app.use(cors()); app.use(express.json());
+const memory=new Map();
+const easyCase={title:'The Last Train from Bellweather',story:'At 9:15, the lights went out at Bellweather station. When they returned, the stationmaster’s silver pocket watch had vanished from his locked office. The last train had not yet left.',suspects:[['Mara Venn','Night porter','She was polishing the waiting room windows.'],['Ivo Pike','Clockmaker','He came to repair the platform clock.'],['Nell Rowan','Stationmaster’s niece','She brought her uncle tea before the blackout.']],clues:['A streak of machine oil marks the office windowsill.','The office key was still in the stationmaster’s coat pocket.','A muddy footprint points toward the clock workshop.','The tea tray was untouched; the cup was cold.','Platform CCTV skips 43 seconds during the blackout; a figure crosses toward the clock workshop.'],hints:['Look closely at the timeline around the blackout.','Consider who had both the access and the right tools.'],culpritId:'s2',solution:'Ivo Pike used the blackout to slip through the office window. The machine oil and CCTV timeline point to the clockmaker; the locked door was a distraction.'};
+const sizes={Easy:[3,5,2,100],Medium:[4,7,3,150],Hard:[5,9,3,200]};
+async function generate(premise,difficulty){
+ const [n,c,h]=sizes[difficulty];
+ if(process.env.GEMINI_API_KEY){
+  const prompt=`Create a fair, logically consistent whodunit for a browser game. Player premise: ${premise}. Difficulty ${difficulty}: exactly ${n} suspects, ${c} clues, ${h} progressive hints. Include at least one physical exhibit and one CCTV or surveillance clue among the clues. Vary other evidence sources where appropriate, such as witness statements, case documents, or forensic findings. Return JSON only: {title,story,suspects:[{name,role,description,alibi}],clues:[string],hints:[string],culpritIndex:number,solution:string}. Clues must support one culprit. Do not put the culprit/solution in story, suspect descriptions, or clues.`;
+  const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL||'gemini-2.0-flash'}:generateContent?key=${process.env.GEMINI_API_KEY}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({contents:[{parts:[{text:prompt}]}],generationConfig:{responseMimeType:'application/json'}})});
+  if(!r.ok) throw new Error('Mystery generation is unavailable. Check the Gemini API key and try again.');
+  const data=await r.json(); const raw=data.candidates?.[0]?.content?.parts?.[0]?.text; const d=JSON.parse(raw);
+  if(!d.title||!d.story||d.suspects?.length!==n||d.clues?.length!==c||d.hints?.length!==h||!Number.isInteger(d.culpritIndex)||!d.suspects[d.culpritIndex]||!d.solution) throw new Error('Generated mystery failed validation. Please try again.');
+  return {...d, culpritId:`s${d.culpritIndex+1}`, suspects:d.suspects.map((x,i)=>({id:`s${i+1}`,...x})), clues:d.clues.map((text,i)=>({id:`c${i+1}`,text,discovered:false}))};
+ }
+ const d={...easyCase};
+ while(d.suspects.length<n)d.suspects.push([{name:'Oren Vale',role:'Signal operator',description:'He was checking the signals.',alibi:'At the signal box.'},{name:'Ada Finch',role:'Ticket clerk',description:'She was closing the ticket office.',alibi:'At the ticket desk.'}][(d.suspects.length-3)%2]);
+ while(d.clues.length<c)d.clues.push(['A faint brass shaving glints beneath the bench.','A witness heard footsteps near the workshop.'][d.clues.length%2]);
+ return {...d,title:premise?`The ${premise.slice(0,42)} Case`:d.title,story:premise?`${premise}\n\n${d.story}`:d.story,suspects:d.suspects.slice(0,n).map((x,i)=>({id:`s${i+1}`,name:x[0]||x.name,role:x[1]||x.role,description:x[2]||x.description,alibi:x[3]||x.alibi})),clues:d.clues.slice(0,c).map((text,i)=>({id:`c${i+1}`,text,discovered:false})),hints:['Look closely at the timeline around the blackout.','Consider who had both the access and the right tools.','The stopped clock is more than a coincidence.'].slice(0,h)};
+}
+app.post('/api/cases',async(req,res)=>{try{const {premise='',difficulty='Easy'}=req.body;if(typeof premise!=='string'||premise.length>240)return res.status(400).json({error:'Premise must be 240 characters or fewer.'});if(!sizes[difficulty])return res.status(400).json({error:'Choose Easy, Medium, or Hard.'});let d=await generate(premise,difficulty);d.premise=premise;d.difficulty=difficulty;d.hintsUsed=0;d.completed=false;d.clues=d.clues||[];let saved;if(process.env.MONGODB_URI&&mongoose.connection.readyState===1)saved=await Case.create(d);else{saved={...d,_id:crypto.randomUUID()};memory.set(saved._id,saved)}res.json({id:String(saved._id),...publicCase(saved)});}catch(e){res.status(500).json({error:e.message||'Could not create the case.'})}});
+function publicCase(c){const {culpritId,solution,hints,...safe}=c.toObject?c.toObject():c;return safe}
+async function getCase(id){if(memory.has(id))return memory.get(id);if(mongoose.connection.readyState===1)return Case.findById(id);return null}
+async function save(c){if(c.save)await c.save();else memory.set(String(c._id),c)}
+app.get('/api/cases/:id',async(req,res)=>{const c=await getCase(req.params.id);if(!c)return res.status(404).json({error:'Case not found.'});res.json({id:String(c._id),...publicCase(c)})});
+app.post('/api/cases/:id/clues/:clueId/discover',async(req,res)=>{const c=await getCase(req.params.id);if(!c)return res.status(404).json({error:'Case not found.'});if(c.completed)return res.status(400).json({error:'This case is already complete.'});const clue=c.clues.find(x=>x.id===req.params.clueId);if(!clue)return res.status(404).json({error:'Clue not found.'});clue.discovered=true;await save(c);res.json({clue,score:score(c)})});
+function score(c){const base=sizes[c.difficulty][3];return Math.max(0,(c.accusation===c.culpritId?base:0)+c.clues.filter(x=>x.discovered).length*5-c.hintsUsed*10)}
+app.post('/api/cases/:id/hints',async(req,res)=>{const c=await getCase(req.params.id);if(!c)return res.status(404).json({error:'Case not found.'});if(c.completed)return res.status(400).json({error:'This case is already complete.'});if(c.hintsUsed>=c.hints.length)return res.status(400).json({error:'You have used all available hints.'});const hint=c.hints[c.hintsUsed++];await save(c);res.json({hint,hintsUsed:c.hintsUsed,score:score(c)})});
+app.post('/api/cases/:id/accuse',async(req,res)=>{const c=await getCase(req.params.id);if(!c)return res.status(404).json({error:'Case not found.'});if(c.completed)return res.status(400).json({error:'This case is already complete.'});if(!c.suspects.some(x=>x.id===req.body.suspectId))return res.status(400).json({error:'Choose a suspect from this case.'});c.accusation=req.body.suspectId;c.completed=true;c.score=score(c);await save(c);res.json({correct:c.accusation===c.culpritId,culprit:c.suspects.find(x=>x.id===c.culpritId),solution:c.solution,score:c.score,difficulty:c.difficulty,title:c.title})});
+app.get('/api/cases/:id/result',async(req,res)=>{const c=await getCase(req.params.id);if(!c)return res.status(404).json({error:'Case not found.'});if(!c.completed)return res.status(403).json({error:'Submit an accusation to reveal the result.'});res.json({correct:c.accusation===c.culpritId,culprit:c.suspects.find(x=>x.id===c.culpritId),solution:c.solution,score:c.score,difficulty:c.difficulty,title:c.title})});
+if(process.env.MONGODB_URI)mongoose.connect(process.env.MONGODB_URI).then(()=>console.log('MongoDB connected')).catch(e=>console.error('MongoDB unavailable; using memory storage:',e.message));
+app.use(express.static('dist'));app.get('*',(req,res)=>res.sendFile(process.cwd()+'/dist/index.html'));
+const port = process.env.PORT || 3002;
+app.listen(port,()=>console.log(`Case Closed API listening on ${port}`));
